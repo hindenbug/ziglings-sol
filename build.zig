@@ -15,7 +15,7 @@ const print = std.debug.print;
 //     1) Getting Started
 //     2) Version Changes
 comptime {
-    const required_zig = "0.11.0-dev.4246";
+    const required_zig = "0.14.0-dev.42";
     const current_zig = builtin.zig_version;
     const min_zig = std.SemanticVersion.parse(required_zig) catch unreachable;
     if (current_zig.order(min_zig) == .lt) {
@@ -103,6 +103,8 @@ const Mode = enum {
     normal,
     /// Named build mode: `zig build -Dn=n`
     named,
+    /// Random build mode: `zig build -Drandom`
+    random,
 };
 
 pub const logo =
@@ -119,7 +121,7 @@ pub const logo =
 ;
 
 pub fn build(b: *Build) !void {
-    if (!validate_exercises()) std.os.exit(2);
+    if (!validate_exercises()) std.process.exit(2);
 
     use_color_escapes = false;
     if (std.io.getStdErr().supportsAnsiEscapeCodes()) {
@@ -158,6 +160,7 @@ pub fn build(b: *Build) !void {
         false;
     const override_healed_path = b.option([]const u8, "healed-path", "Override healed path");
     const exno: ?usize = b.option(usize, "n", "Select exercise");
+    const rand: ?bool = b.option(bool, "random", "Select random exercise");
 
     const sep = std.fs.path.sep_str;
     const healed_path = if (override_healed_path) |path|
@@ -172,7 +175,7 @@ pub fn build(b: *Build) !void {
         // Named build mode: verifies a single exercise.
         if (n == 0 or n > exercises.len - 1) {
             print("unknown exercise number: {}\n", .{n});
-            std.os.exit(2);
+            std.process.exit(2);
         }
         const ex = exercises[n - 1];
 
@@ -188,6 +191,33 @@ pub fn build(b: *Build) !void {
 
         zigling_step.dependOn(&verify_step.step);
 
+        return;
+    }
+
+    if (rand) |_| {
+        // Random build mode: verifies one random exercise.
+        // like for 'exno' but chooses a random exersise number.
+        print("work in progress: check a random exercise\n", .{});
+
+        var prng = std.Random.DefaultPrng.init(blk: {
+            var seed: u64 = undefined;
+            try std.posix.getrandom(std.mem.asBytes(&seed));
+            break :blk seed;
+        });
+        const rnd = prng.random();
+        const ex = exercises[rnd.intRangeLessThan(usize, 0, exercises.len)];
+
+        print("random exercise: {s}\n", .{ex.main_file});
+
+        const zigling_step = b.step(
+            "random",
+            b.fmt("Check the solution of {s}", .{ex.main_file}),
+        );
+        b.default_step = zigling_step;
+        zigling_step.dependOn(&header_step.step);
+        const verify_step = ZiglingStep.create(b, ex, work_path, .random);
+        verify_step.step.dependOn(&header_step.step);
+        zigling_step.dependOn(&verify_step.step);
         return;
     }
 
@@ -244,10 +274,10 @@ const ZiglingStep = struct {
         return self;
     }
 
-    fn make(step: *Step, prog_node: *std.Progress.Node) !void {
+    fn make(step: *Step, prog_node: std.Progress.Node) !void {
         // NOTE: Using exit code 2 will prevent the Zig compiler to print the message:
         // "error: the following build command failed with exit code 1:..."
-        const self = @fieldParentPtr(ZiglingStep, "step", step);
+        const self: *ZiglingStep = @alignCast(@fieldParentPtr("step", step));
 
         if (self.exercise.skip) {
             print("Skipping {s}\n\n", .{self.exercise.main_file});
@@ -262,7 +292,7 @@ const ZiglingStep = struct {
                 print("\n{s}Ziglings hint: {s}{s}", .{ bold_text, hint, reset_text });
 
             self.help();
-            std.os.exit(2);
+            std.process.exit(2);
         };
 
         self.run(exe_path.?, prog_node) catch {
@@ -272,23 +302,23 @@ const ZiglingStep = struct {
                 print("\n{s}Ziglings hint: {s}{s}", .{ bold_text, hint, reset_text });
 
             self.help();
-            std.os.exit(2);
+            std.process.exit(2);
         };
 
         // Print possible warning/debug messages.
         self.printErrors();
     }
 
-    fn run(self: *ZiglingStep, exe_path: []const u8, _: *std.Progress.Node) !void {
+    fn run(self: *ZiglingStep, exe_path: []const u8, _: std.Progress.Node) !void {
         resetLine();
-        print("Checking {s}...\n", .{self.exercise.main_file});
+        print("Checking: {s}\n", .{self.exercise.main_file});
 
         const b = self.step.owner;
 
         // Allow up to 1 MB of stdout capture.
         const max_output_bytes = 1 * 1024 * 1024;
 
-        var result = Child.exec(.{
+        const result = Child.run(.{
             .allocator = b.allocator,
             .argv = &.{exe_path},
             .cwd = b.build_root.path.?,
@@ -306,7 +336,7 @@ const ZiglingStep = struct {
         }
     }
 
-    fn check_output(self: *ZiglingStep, result: Child.ExecResult) !void {
+    fn check_output(self: *ZiglingStep, result: Child.RunResult) !void {
         const b = self.step.owner;
 
         // Make sure it exited cleanly.
@@ -355,7 +385,7 @@ const ZiglingStep = struct {
         print("{s}PASSED:\n{s}{s}\n\n", .{ green_text, output, reset_text });
     }
 
-    fn check_test(self: *ZiglingStep, result: Child.ExecResult) !void {
+    fn check_test(self: *ZiglingStep, result: Child.RunResult) !void {
         switch (result.term) {
             .Exited => |code| {
                 if (code != 0) {
@@ -375,8 +405,8 @@ const ZiglingStep = struct {
         print("{s}PASSED{s}\n\n", .{ green_text, reset_text });
     }
 
-    fn compile(self: *ZiglingStep, prog_node: *std.Progress.Node) !?[]const u8 {
-        print("Compiling {s}...\n", .{self.exercise.main_file});
+    fn compile(self: *ZiglingStep, prog_node: std.Progress.Node) !?[]const u8 {
+        print("Compiling: {s}\n", .{self.exercise.main_file});
 
         const b = self.step.owner;
         const exercise_path = self.exercise.main_file;
@@ -386,7 +416,7 @@ const ZiglingStep = struct {
         var zig_args = std.ArrayList([]const u8).init(b.allocator);
         defer zig_args.deinit();
 
-        zig_args.append(b.zig_exe) catch @panic("OOM");
+        zig_args.append(b.graph.zig_exe) catch @panic("OOM");
 
         const cmd = switch (self.exercise.kind) {
             .exe => "build-exe",
@@ -417,6 +447,7 @@ const ZiglingStep = struct {
         const cmd = switch (self.mode) {
             .normal => "zig build",
             .named => b.fmt("zig build -Dn={s}", .{key}),
+            .random => "zig build -Drandom",
         };
 
         print("\n{s}Edit exercises/{s} and run '{s}' again.{s}\n", .{
@@ -459,7 +490,7 @@ fn resetLine() void {
 pub fn trimLines(allocator: std.mem.Allocator, buf: []const u8) ![]const u8 {
     var list = try std.ArrayList(u8).initCapacity(allocator, buf.len);
 
-    var iter = std.mem.split(u8, buf, " \n");
+    var iter = std.mem.splitSequence(u8, buf, " \n");
     while (iter.next()) |line| {
         // TODO: trimming CR characters is probably not necessary.
         const data = std.mem.trimRight(u8, line, " \r");
@@ -494,9 +525,8 @@ const PrintStep = struct {
         return self;
     }
 
-    fn make(step: *Step, _: *std.Progress.Node) !void {
-        const self = @fieldParentPtr(PrintStep, "step", step);
-
+    fn make(step: *Step, _: std.Progress.Node) !void {
+        const self: *PrintStep = @alignCast(@fieldParentPtr("step", step));
         print("{s}", .{self.message});
     }
 };
@@ -522,7 +552,7 @@ fn validate_exercises() bool {
             return false;
         }
 
-        var iter = std.mem.split(u8, ex.output, "\n");
+        var iter = std.mem.splitScalar(u8, ex.output, '\n');
         while (iter.next()) |line| {
             const output = std.mem.trimRight(u8, line, " \r");
             if (output.len != line.len) {
@@ -839,7 +869,7 @@ const exercises = [_]Exercise{
     },
     .{
         .main_file = "060_floats.zig",
-        .output = "Shuttle liftoff weight: 1995796kg",
+        .output = "Shuttle liftoff weight: 2032092kg",
     },
     .{
         .main_file = "061_coercions.zig",
@@ -939,7 +969,7 @@ const exercises = [_]Exercise{
     .{
         .main_file = "082_anonymous_structs3.zig",
         .output =
-        \\"0"(bool):true "1"(bool):false "2"(i32):42 "3"(f32):3.14159202e+00
+        \\"0"(bool):true "1"(bool):false "2"(i32):42 "3"(f32):3.141592e0
         ,
         .hint = "This one is a challenge! But you have everything you need.",
     },
@@ -1101,6 +1131,35 @@ const exercises = [_]Exercise{
         \\and
         \\despair
         \\This little poem has 15 words!
+        ,
+    },
+    .{
+        .main_file = "104_threading.zig",
+        .output =
+        \\Starting work...
+        \\thread 1: started.
+        \\thread 2: started.
+        \\thread 3: started.
+        \\Some weird stuff, after starting the threads.
+        \\thread 2: finished.
+        \\thread 1: finished.
+        \\thread 3: finished.
+        \\Zig is cool!
+        ,
+    },
+    .{
+        .main_file = "105_threading2.zig",
+        .output = "PI ≈ 3.14159265",
+    },
+    .{
+        .main_file = "106_files.zig",
+        .output = "Successfully wrote 18 bytes.",
+    },
+    .{
+        .main_file = "107_files2.zig",
+        .output =
+        \\AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+        \\Successfully Read 18 bytes: It's zigling time!
         ,
     },
     .{
